@@ -30,7 +30,8 @@ build() {
   yes "" | make oldconfig
 
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
-  make CC=musl-gcc
+  make
+  # make CC=musl-gcc
 }
 
 check() {

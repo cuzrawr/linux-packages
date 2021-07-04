@@ -2,7 +2,7 @@
 # Maintainer: 
 
 pkgname=busybox-alpinevariant-git
-pkgver=1.33.0.r286.g51358757c
+pkgver=1.33.0.r363.g08ca313d7
 pkgrel=1
 pkgdesc="Tiny versions of many common UNIX utilities"
 arch=('i686' 'x86_64')
@@ -30,7 +30,8 @@ build() {
   yes "" | make oldconfig
 
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
-  make CC=musl-gcc
+  make
+#  make CC=musl-gcc
 }
 
 check() {

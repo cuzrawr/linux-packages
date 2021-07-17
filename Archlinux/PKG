@@ -32,7 +32,11 @@ build() {
   make menuconfig
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
   make
+<<<<<<< HEAD
 #  make CC=musl-gcc
+=======
+  # make CC=musl-gcc
+>>>>>>> 1aea2ad71ec3293506be547ef781e45bd7f8f2c3
 }
 
 check() {

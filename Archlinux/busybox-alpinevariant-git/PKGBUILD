@@ -2,13 +2,13 @@
 # Maintainer: 
 
 pkgname=busybox-alpinevariant-git
-pkgver=1.33.0.r363.g08ca313d7
+pkgver=1.33.0.r383.gdabbeeb79
 pkgrel=1
 pkgdesc="Tiny versions of many common UNIX utilities"
 arch=('i686' 'x86_64')
 url="https://www.busybox.net/"
 license=('GPL')
-makedepends=('git' 'kernel-headers-musl' 'musl' 'ncurses')
+makedepends=('git' 'ncurses')
 provides=('busybox')
 conflicts=("busybox" "busybox-custom" "busybox-git")
 source=("git+https://git.busybox.net/busybox"
@@ -29,6 +29,7 @@ build() {
   cp "$srcdir/config" ".config"
   yes "" | make oldconfig
 
+  make menuconfig
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
   make
 #  make CC=musl-gcc

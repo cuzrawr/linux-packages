@@ -2,7 +2,7 @@
 # Maintainer: 
 
 pkgname=busybox-alpinevariant-git
-pkgver=1.33.0.r383.gdabbeeb79
+pkgver=1.34.0.r56.g9346ea955
 pkgrel=1
 pkgdesc="Tiny versions of many common UNIX utilities"
 arch=('i686' 'x86_64')
@@ -26,10 +26,12 @@ pkgver() {
 build() {
   cd "busybox"
 
-  cp "$srcdir/config" ".config"
+  #cp "$srcdir/config" ".config"
   yes "" | make oldconfig
   #cp "EDITTHIS  config-example-latest" ".config"
   
+  cp "$srcdir/../config-example-latest" ".config"
+    
   make menuconfig
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
   make

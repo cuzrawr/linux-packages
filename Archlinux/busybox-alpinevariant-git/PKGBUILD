@@ -29,10 +29,14 @@ build() {
   #cp "$srcdir/config" ".config"
   yes "" | make oldconfig
   #cp "EDITTHIS  config-example-latest" ".config"
-  
+    
   cp "$srcdir/../config-example-latest" "$srcdir/busybox/.config"
+  cp "$srcdir/../show_history-patch.lineedit.c.patch" "$srcdir/busybox/lineedit.c.patch"
     
   make menuconfig
+  # apply fancy show_history output patch
+  patch -p0 < lineedit.c.patch
+  
   export KCONFIG_NOTIMESTAMP=1  # reproducible build
   make
 }

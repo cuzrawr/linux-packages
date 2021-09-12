@@ -30,7 +30,7 @@ build() {
   yes "" | make oldconfig
   #cp "EDITTHIS  config-example-latest" ".config"
   
-  cp "$srcdir/../config-example-latest" ".config"
+  cp "$srcdir/../config-example-latest" "$srcdir/busybox/.config"
     
   make menuconfig
   export KCONFIG_NOTIMESTAMP=1  # reproducible build

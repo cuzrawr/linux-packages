@@ -2,5 +2,5 @@
 #### no job control
 #### no network utils
 #### built mostly for ash shell 
-#### history after exit
+#### awk & vi - disabled shell commands execution
 #### use /usr/bin/* instead of built-in

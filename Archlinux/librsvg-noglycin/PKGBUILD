@@ -1,0 +1,46 @@
+# Maintainer: cuzrawr
+
+pkgname=librsvg-noglycin
+pkgver=2.63.2
+pkgrel=1
+epoch=2
+pkgdesc='SVG rendering library with the native GDK-Pixbuf loader enabled'
+arch=(x86_64)
+url='https://gitlab.gnome.org/GNOME/librsvg'
+license=(LGPL-2.1-or-later)
+depends=(
+  cairo dav1d fontconfig freetype2 gdk-pixbuf2-noglycin glib2 glibc
+  harfbuzz libgcc libxml2 pango
+)
+makedepends=(cargo-c gobject-introspection meson rust vala)
+checkdepends=(ttf-dejavu)
+provides=("librsvg=$epoch:$pkgver" librsvg-2.so)
+conflicts=(librsvg)
+source=("https://download.gnome.org/sources/librsvg/${pkgver%.*}/librsvg-$pkgver.tar.xz")
+sha256sums=('852b18e1a00b8605528825a27dc7748bff2a5dd254028f59dc22a34ea57e81b6')
+
+prepare() {
+  cd "librsvg-$pkgver"
+  cargo fetch --locked --target host-tuple
+}
+
+build() {
+  arch-meson "librsvg-$pkgver" build \
+    -Davif=enabled \
+    -Dpixbuf=enabled \
+    -Dpixbuf-loader=enabled \
+    -Dintrospection=enabled \
+    -Dvala=enabled \
+    -Drsvg-convert=enabled \
+    -Ddocs=disabled \
+    -Dtests=true
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --no-rebuild --print-errorlogs
+}
+
+package() {
+  meson install -C build --no-rebuild --destdir "$pkgdir"
+}

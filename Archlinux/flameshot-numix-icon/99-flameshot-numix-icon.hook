@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/share/icons/Numix-Square/index.theme
+Target = usr/share/icons/Numix-Square/48/apps/flameshot.svg
+
+[Action]
+Description = Updating the Flameshot tray icon alias in Numix-Square...
+When = PostTransaction
+Depends = gtk-update-icon-cache
+Exec = /usr/bin/sh -ec 'cd /usr/share/icons/Numix-Square || exit 0; icon=48/apps/flameshot-tray.svg; if [ -f 48/apps/flameshot.svg ]; then [ -e "$icon" ] || [ -L "$icon" ] || ln -s flameshot.svg "$icon"; elif [ "$(readlink "$icon")" = flameshot.svg ]; then rm "$icon"; fi; [ ! -f index.theme ] || gtk-update-icon-cache -q -f .'

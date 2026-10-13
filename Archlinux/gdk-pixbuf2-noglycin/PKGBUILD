@@ -1,0 +1,56 @@
+# Maintainer: cuzrawr
+
+pkgname=gdk-pixbuf2-noglycin
+pkgver=2.44.8
+pkgrel=1
+pkgdesc='Image loading library with native loaders instead of glycin'
+arch=(x86_64)
+url='https://gitlab.gnome.org/GNOME/gdk-pixbuf'
+license=(LGPL-2.1-or-later)
+depends=(glib2 glibc libjpeg-turbo libpng libtiff shared-mime-info)
+makedepends=(glib2-devel gobject-introspection meson python-docutils)
+optdepends=(
+  'librsvg-noglycin: SVG loader'
+  'libopenraw: Camera RAW loader'
+  'libwmf: WMF loader'
+  'webp-pixbuf-loader: WebP loader'
+)
+provides=("gdk-pixbuf2=$pkgver" libgdk_pixbuf-2.0.so)
+conflicts=(gdk-pixbuf2)
+source=(
+  "https://download.gnome.org/sources/gdk-pixbuf/${pkgver%.*}/gdk-pixbuf-$pkgver.tar.xz"
+  gdk-pixbuf-query-loaders.hook
+  gdk-pixbuf-remove-loaders-cache.hook
+)
+sha256sums=('919f529512961a12e81cd4b4b466a48c3933469e7f9a310c6513cd4fb252ba3c'
+            '8baf93a1765301c0926a14473241e7d3fbec57c9dd0ecfd811b6379a0d9d79ac'
+            'f57cb4a91f97002a48ed871829c9e6552074016f144662fb0a7bde99811d9ec7')
+
+build() {
+  arch-meson "gdk-pixbuf-$pkgver" build \
+    -Dglycin=disabled \
+    -Dandroid=disabled \
+    -Dpng=enabled \
+    -Djpeg=enabled \
+    -Dgif=enabled \
+    -Dtiff=enabled \
+    -Dothers=enabled \
+    -Dlegacy_xpm=enabled \
+    -Dbuiltin_loaders=all \
+    -Dthumbnailer=enabled \
+    -Dintrospection=enabled \
+    -Ddocumentation=false \
+    -Dman=true \
+    -Dtests=true \
+    -Dinstalled_tests=false
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --no-rebuild --print-errorlogs
+}
+
+package() {
+  meson install -C build --no-rebuild --destdir "$pkgdir"
+  install -Dm644 "$srcdir/"*.hook -t "$pkgdir/usr/share/libalpm/hooks/"
+}

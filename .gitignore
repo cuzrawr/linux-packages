@@ -1,0 +1,7 @@
+# Generated makepkg output
+/Archlinux/*/src/
+/Archlinux/*/pkg/
+/Archlinux/*/*.pkg.tar.*
+/Archlinux/*/*.src.tar.*
+/Archlinux/*/*.tar.xz
+/Archlinux/*/*.log

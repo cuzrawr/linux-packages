@@ -1,7 +1,7 @@
 # Maintainer: cuzrawr
 
 pkgname=librsvg-noglycin
-pkgver=2.63.2
+pkgver=2.63.4
 pkgrel=1
 epoch=2
 pkgdesc='SVG rendering library with the native GDK-Pixbuf loader enabled'
@@ -17,7 +17,7 @@ checkdepends=(ttf-dejavu)
 provides=("librsvg=$epoch:$pkgver" librsvg-2.so)
 conflicts=(librsvg)
 source=("https://download.gnome.org/sources/librsvg/${pkgver%.*}/librsvg-$pkgver.tar.xz")
-sha256sums=('852b18e1a00b8605528825a27dc7748bff2a5dd254028f59dc22a34ea57e81b6')
+sha256sums=('31f07d9350dad3f8964fd613c31309ac160fdef13dfac59df6fd082de78d6e8f')
 
 prepare() {
   cd "librsvg-$pkgver"

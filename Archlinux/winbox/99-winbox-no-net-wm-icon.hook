@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = opt/winbox/winbox
+
+[Action]
+Description = Renaming _NET_WM_ICON from WinBox...
+When = PostTransaction
+Depends = sed
+Exec = /usr/bin/sed -i "s/_NET_WM_ICON/_CONICONICON/g" /opt/winbox/winbox

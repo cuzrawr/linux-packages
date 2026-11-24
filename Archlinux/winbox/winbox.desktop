@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WinBox
+Comment=Mikrotik RouterOS GUI Configurator
+Exec=/usr/bin/env --unset=QT_QPA_PLATFORM /usr/local/bin/winbox
+Icon=winbox
+Terminal=false
+Categories=Utility
+StartupWMClass=winbox

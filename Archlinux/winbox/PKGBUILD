@@ -1,0 +1,55 @@
+# Maintainer: cuzrawr
+#
+# WinBox 4.x packaged into /opt with a maintainer-owned SVG icon.
+# Switch the icon source once numix-core merges a native winbox icon
+# (numixproject/numix-core PR #5777).
+# Update: set pkgver to the release on mikrotik.com/download, then updpkgsums.
+
+pkgname=winbox
+pkgver=4.5
+pkgrel=1
+pkgdesc='Mikrotik RouterOS GUI Configurator'
+url='https://mikrotik.com/download'
+arch=('x86_64')
+license=('custom')
+options=('!debug')
+depends=('dbus'
+         'fontconfig'
+         'freetype2'
+         'glibc'
+         'hicolor-icon-theme'
+         'libglvnd'
+         'libx11'
+         'libxcb'
+         'libxkbcommon'
+         'libxkbcommon-x11'
+         'xcb-util-image'
+         'xcb-util-keysyms'
+         'xcb-util-renderutil'
+         'xcb-util-wm')
+source=("WinBox-${pkgver}.zip::https://download.mikrotik.com/routeros/winbox/${pkgver}/WinBox_Linux.zip"
+        "${pkgname}.svg"
+        "${pkgname}.desktop"
+        "99-${pkgname}-no-net-wm-icon.hook")
+sha256sums=('5192817089eb91ac5d03edc68661b2603ef81f8098627ab4fd9425b6cc7546a2'
+            'a92e6862c5ab6eda3b2b3dc4ecb47c9fd2b6c596258389c23a7935ce546f07fe'
+            '70125c9b8dc3b7ffef929947787c3ce629a45994100c177ca3323dd1c1f83d9b'
+            'b4e9f99e31109e19def39fb9c6f6df12221a12a495beab0a024e0f2e7e8c8246')
+
+# The zip ships the Qt-static binary and an upstream PNG icon (not used here;
+# the maintainer SVG replaces it). Depends cover every NEEDED library of the
+# binary (verified against readelf and pacman -Qo); Qt resources are embedded.
+# The binary itself lands at /opt/winbox/winbox (lowercase, matching the
+# desktop StartupWMClass); /usr/local/bin/winbox is a pacman-managed symlink
+# (FHS: /usr/local/bin for locally administered commands, not package-owned /usr/bin).
+package() {
+  install -Dm0755 WinBox "${pkgdir}/opt/${pkgname}/winbox"
+  install -Dm0644 "${pkgname}.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/${pkgname}.svg"
+  install -Dm0644 "${pkgname}.desktop" \
+    "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm0644 "99-${pkgname}-no-net-wm-icon.hook" \
+    "${pkgdir}/usr/share/libalpm/hooks/99-${pkgname}-no-net-wm-icon.hook"
+  install -d "${pkgdir}/usr/local/bin"
+  ln -s "/opt/${pkgname}/winbox" "${pkgdir}/usr/local/bin/winbox"
+}

@@ -1,0 +1,1215 @@
+Upstream: https://github.com/ggml-org/llama.cpp/pull/32919 (65758d01f5..884c478c29)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 45bfe52f4c..c287f99ab1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1793,21 +1793,18 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
+ 
+ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+ 
+-    bool kscales2 = false;    // two scale sets per block
+     bool has_dm   = false;    // d+m as vec2 + b-side sum
+     bool has_kvalues = false;
+     switch (src0_type) {
+         case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K:
+             break;
+         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+             has_dm = true;                          break;
+         case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_MXFP4:
+-            has_kvalues = true;                     break;
+-        case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K:
+-            kscales2 = true;                        break;
+         case GGML_TYPE_NVFP4:
+-            kscales2 = true; has_kvalues = true;    break;
++            has_kvalues = true;                     break;
+         default:
+             return false;
+     }
+@@ -1818,13 +1815,11 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const
+     const uint32_t BK      = 32;
+     const uint32_t BK_STEP = mul_mat_id ? 2u : 4u;
+     const uint32_t QPITCH  = BK_STEP * (BK / 4u) + 4u;
+-    const uint32_t KSCALES = kscales2 ? 2u : 1u;
+ 
+     uint32_t total = 0;
+     total += BM * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_a_qs
+     total += BN * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_b_qs
+-    total += has_dm ? (BM * BK_STEP * 2u * (uint32_t)sizeof(float))   // buf_a_dm (vec2)
+-                    : (BM * BK_STEP * KSCALES * (uint32_t)sizeof(float)); // buf_a_d
++    total += BM * BK_STEP * 2u * (uint32_t)sizeof(float); // buf_a_dm / buf_a_dn (vec2) or buf_a_d (2 scales)
+     total += BN * BK_STEP * (uint32_t)sizeof(float);     // buf_b_d
+     if (has_dm) {
+         total += BN * BK_STEP * (uint32_t)sizeof(float); // buf_b_s
+@@ -7037,8 +7032,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     }
+ 
+     // The partial tiles of a quantized A rely on the bound range to read zeros past the last row,
+-    // so the range stays exact: the strided extent of a tensor read in place, the staged size otherwise.
+-    const uint64_t x_range = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
++    // so the range stays tight: the strided extent of a tensor read in place, rounded up to whole
++    // dwords for the shaders that load A as uint32, or the staged size otherwise.
++    const uint64_t x_range = qx_needs_dequant ? x_sz : std::min<uint64_t>(ggml_vk_align_size(ggml_nbytes(src0), 4), d_X->size - x_buf_offset);
+     const uint64_t y_range = (qy_needs_dequant || quantize_y) ? y_sz : ggml_nbytes(src1);
+ 
+     uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+@@ -8200,7 +8196,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     }
+     ggml_vk_sync_buffers(ctx, subctx);
+ 
+-    const uint64_t x_range = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
++    const uint64_t x_range = qx_needs_dequant ? x_sz : std::min<uint64_t>(ggml_vk_align_size(ggml_nbytes(src0), 4), d_X->size - x_buf_offset);
+     const uint64_t y_range = (qy_needs_dequant || quantize_y) ? y_sz : ggml_nbytes(src1);
+ 
+     uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
+index eaf7eb65d4..e67d62f492 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
+@@ -25,6 +25,17 @@
+ #define KSCALES 1
+ #endif
+ 
++// Asymmetric types: A scales are (d, m) and B needs its block sums.
++#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#define A_HAS_MIN
++#endif
++
++#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
++#define A_KVALUES kvalues_iq4nl_const
++#elif defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
++#define A_KVALUES kvalues_mxfp4_const
++#endif
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+@@ -34,6 +45,8 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
+ #if defined(A_TYPE_PACKED32)
+ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+ #endif
++// A as raw dwords, for a_load_window()
++layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+ layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+ 
+@@ -84,6 +97,7 @@ layout (constant_id = 8) const uint TN = 16;
+ layout (constant_id = 9) const uint TK = 16;
+ layout (constant_id = 10) const uint WARP = 32;
+ layout (constant_id = 11) const uint DEVICE_ARCH = 0; // vk_device_architecture (ggml-vulkan.cpp)
++#define VK_ARCH_AMD_RDNA3 4u
+ #define VK_ARCH_AMD_RDNA4 5u
+ 
+ #define BK 32
+@@ -97,20 +111,23 @@ layout (constant_id = 11) const uint DEVICE_ARCH = 0; // vk_device_architecture
+ const uint QPITCH = BK_STEP * (BK / 4) + 4;
+ 
+ shared uint32_t buf_a_qs[BM * QPITCH];
+-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#ifdef A_HAS_MIN
+ shared vec2 buf_a_dm[BM * BK_STEP];   // .x = d, .y = m
+-#else
++#elif KSCALES == 2
+ shared float buf_a_d[BM * BK_STEP * KSCALES];
++#else
++shared vec2 buf_a_dn[BM * BK_STEP];   // .x = d, .y = -ACC_BIAS_F * d
+ #endif
+ 
+-shared uint32_t buf_b_qs[BN * QPITCH];
++// uvec4 so that the B stores and fragment loads move 16 bytes per access
++shared uvec4 buf_b_qs[BN * QPITCH / 4];
+ shared float buf_b_d[BN * BK_STEP];
+ 
+-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#ifdef A_HAS_MIN
+ shared float buf_b_s[BN * BK_STEP];
+ #endif
+ 
+-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
++#ifdef A_KVALUES
+ shared int8_t cm1_kvalues[16];
+ #endif
+ 
+@@ -124,7 +141,8 @@ shared int8_t cm1_kvalues[16];
+ const uint CM_ELEMS = (TM * TN) / WARP;
+ #define ACC_BIAS_BITS 0x4B400000
+ #define ACC_BIAS_F    12582912.0f
+-const bool USE_MAGIC_BIAS = WARP != 32;
++// wave32: the bias measured faster on RDNA3 for all tested models, but slower on RDNA4 for MoE models
++#define USE_MAGIC_BIAS (WARP != 32 || DEVICE_ARCH == VK_ARCH_AMD_RDNA3)
+ 
+ // Accumulator row for element e: RDNA4 blocked, RDNA3/3.5 interleaved.
+ uint cm_elem_row(uint e) {
+@@ -132,13 +150,13 @@ uint cm_elem_row(uint e) {
+     return (DEVICE_ARCH == VK_ARCH_AMD_RDNA4) ? (e + row_half * CM_ELEMS) : (row_half + 2u * e);
+ }
+ 
+-// min_term = asymmetric-quant min*b_sum correction (0 for symmetric types).
++// min_term = asymmetric-quant min*b_sum correction; pass -0.0 for symmetric types so prev + min_term folds away.
+ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, float scale_b, float min_term) {
+     if (USE_MAGIC_BIAS) {
+         const float t = fma(intBitsToFloat(acc_e), scale_a, nbias_a);
+         return ACC_TYPE(fma(t, scale_b, float(prev) + min_term));
+     }
+-    return prev + ACC_TYPE(fma(float(acc_e) * scale_a, scale_b, min_term));
++    return ACC_TYPE(fma(float(acc_e) * scale_a, scale_b, float(prev) + min_term));
+ }
+ 
+ #ifdef MUL_MAT_ID
+@@ -158,21 +176,11 @@ void main() {
+     _ne1 = data_row_map[2 + 2 * tile_idx];
+     const uint ic = 0;
+ #endif
+-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+-    if (gl_LocalInvocationIndex < 16u) {
+-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_iq4nl_const[gl_LocalInvocationIndex];
+-    }
+-    barrier();
+-#elif defined(DATA_A_MXFP4)
+-    if (gl_LocalInvocationIndex < 16u) {
+-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
+-    }
+-    barrier();
+-#elif defined(DATA_A_NVFP4)
++#ifdef A_KVALUES
+     if (gl_LocalInvocationIndex < 16u) {
+-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
++        cm1_kvalues[gl_LocalInvocationIndex] = A_KVALUES[gl_LocalInvocationIndex];
+     }
+-#if !defined(USE_OCP_FP4)
++#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
+     for (uint i = gl_LocalInvocationIndex; i < 256u; i += BLOCK_SIZE) {
+         ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
+     }
+@@ -270,6 +278,8 @@ void main() {
+ 
+     block_a_prefetch pre_a[A_LOADS * BK_STEP];
+     block_b_prefetch pre_b[B_LOADS * BK_STEP];
++    const uint A_SCALE_LOADS = (BM * BK_STEP + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    block_a_scale pre_sc[A_SCALE_LOADS];
+ 
+     if (start_k < end_k) {
+         PREFETCH_BLOCK(start_k)
+@@ -311,15 +321,14 @@ void main() {
+                     float scale_a[CM_ELEMS];
+                     float nbias_a[CM_ELEMS];
+                     [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+-                        scale_a[e] = buf_a_d[(ks * KSCALES + h) * BM + a_row0 + r * TM + cm_elem_row(e)];
+-                        if (USE_MAGIC_BIAS) {
+-                            nbias_a[e] = -ACC_BIAS_F * scale_a[e];
+-                        }
++                        const vec3 s = a_scale_fetch(ks, h, a_row0 + r * TM + cm_elem_row(e));
++                        scale_a[e] = s.x;
++                        nbias_a[e] = s.y;
+                     }
+ 
+                     [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                         coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+-                        coopMatLoad(cache_b, buf_b_qs, (b_col0 + c * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
++                        coopMatLoad(cache_b, buf_b_qs, ((b_col0 + c * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4)) / 4, QPITCH / 4, gl_CooperativeMatrixLayoutColumnMajor);
+ 
+                         const float scale_b_v = buf_b_d[ks * BN + b_col0 + c * TN + elem_col0];
+ 
+@@ -332,12 +341,12 @@ void main() {
+                         [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                             sums[tile_idx * CM_ELEMS + e] = cm1_accumulate(
+                                 sums[tile_idx * CM_ELEMS + e], int(acc[e]),
+-                                scale_a[e], nbias_a[e], scale_b_v, 0.0);
++                                scale_a[e], nbias_a[e], scale_b_v, -0.0);
+                         }
+                     }
+                 }
+             }
+-#elif defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#else
+             // Preload all A/B fragments up front (ILP).
+             coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row * K_SUB];
+             coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col * K_SUB];
+@@ -349,76 +358,31 @@ void main() {
+             }
+             [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                 [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+-                    coopMatLoad(cache_b[c * K_SUB + h], buf_b_qs, (b_col0 + c * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
++                    coopMatLoad(cache_b[c * K_SUB + h], buf_b_qs, ((b_col0 + c * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4)) / 4, QPITCH / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                 }
+             }
+ 
+             float scale_b[cms_per_col];
+-            float bs[cms_per_col];
+             [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                 scale_b[c] = buf_b_d[ks * BN + b_col0 + c * TN + elem_col0];
+-                bs[c] = float(buf_b_s[ks * BN + b_col0 + c * TN + elem_col0]);
+-            }
+-
+-            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+-                float scale_a[CM_ELEMS];
+-                float nbias_a[CM_ELEMS];
+-                float ma[CM_ELEMS];
+-                [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+-                    vec2 dm = buf_a_dm[ks * BM + a_row0 + r * TM + cm_elem_row(e)];
+-                    scale_a[e] = dm.x;
+-                    if (USE_MAGIC_BIAS) {
+-                        nbias_a[e] = -ACC_BIAS_F * scale_a[e];
+-                    }
+-                    ma[e] = dm.y;
+-                }
+-
+-                [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+-                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+-                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+-                            USE_MAGIC_BIAS ? ACC_BIAS_BITS : 0);
+-
+-                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+-                        acc = coopMatMulAdd(cache_a[r * K_SUB + h], cache_b[c * K_SUB + h], acc);
+-                    }
+-
+-                    const uint tile_idx = r * cms_per_col + c;
+-                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+-                        sums[tile_idx * CM_ELEMS + e] = cm1_accumulate(
+-                            sums[tile_idx * CM_ELEMS + e], int(acc[e]),
+-                            scale_a[e], nbias_a[e], scale_b[c], ma[e] * bs[c]);
+-                    }
+-                }
+-            }
+-#else
+-            // Preload all A/B fragments up front (ILP).
+-            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row * K_SUB];
+-            coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col * K_SUB];
+-
+-            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+-                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+-                    coopMatLoad(cache_a[r * K_SUB + h], buf_a_qs, (a_row0 + r * TM) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+-                }
+             }
++#ifdef A_HAS_MIN
++            float bs[cms_per_col];
+             [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+-                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+-                    coopMatLoad(cache_b[c * K_SUB + h], buf_b_qs, (b_col0 + c * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
+-                }
+-            }
+-
+-            float scale_b[cms_per_col];
+-            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+-                scale_b[c] = buf_b_d[ks * BN + b_col0 + c * TN + elem_col0];
++                bs[c] = float(buf_b_s[ks * BN + b_col0 + c * TN + elem_col0]);
+             }
++#endif
+ 
++            // The scales are kept in scalar arrays: a vec3 array made LLPC stop fully unrolling the ks loop.
+             [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+                 float scale_a[CM_ELEMS];
+                 float nbias_a[CM_ELEMS];
++                float min_a[CM_ELEMS];
+                 [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+-                    scale_a[e] = buf_a_d[ks * BM + a_row0 + r * TM + cm_elem_row(e)];
+-                    if (USE_MAGIC_BIAS) {
+-                        nbias_a[e] = -ACC_BIAS_F * scale_a[e];
+-                    }
++                    const vec3 s = a_scale_fetch(ks, 0, a_row0 + r * TM + cm_elem_row(e));
++                    scale_a[e] = s.x;
++                    nbias_a[e] = s.y;
++                    min_a[e] = s.z;
+                 }
+ 
+                 [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+@@ -432,9 +396,14 @@ void main() {
+ 
+                     const uint tile_idx = r * cms_per_col + c;
+                     [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
++#ifdef A_HAS_MIN
++                        const float min_term = min_a[e] * bs[c];
++#else
++                        const float min_term = -0.0;
++#endif
+                         sums[tile_idx * CM_ELEMS + e] = cm1_accumulate(
+                             sums[tile_idx * CM_ELEMS + e], int(acc[e]),
+-                            scale_a[e], nbias_a[e], scale_b[c], 0.0);
++                            scale_a[e], nbias_a[e], scale_b[c], min_term);
+                     }
+                 }
+             }
+@@ -448,6 +417,9 @@ void main() {
+ #undef PREFETCH_BLOCK
+ #undef STORE_BLOCK_TO_LDS
+ #undef B_IB_CALC
++#undef A_STORE_LOOP
++#undef A_IB_LO_FIXED
++#undef A_IB_LO_UNIFORM
+ 
+     const uint dr = ir * BM + a_row0;
+     const uint dc = ic * BN + b_col0;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
+index 50c61f6cff..6b4e562f51 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
+@@ -3,110 +3,166 @@
+ //   struct block_a_prefetch  — register data for one A-block per thread
+ //   block_a_load()           — load from global memory into a block_a_prefetch
+ //   block_a_to_shmem()       — unpack and write to shared memory
++//   struct block_a_scale     - raw scale data of one A-block, loaded by a single thread
++//   block_a_scale_load()     - load from global memory into a block_a_scale
++//   block_a_scale_to_shmem() - decode and write to shared memory with a_scale_store()
++//   A_IB_LO_MASK             - the low A-block index bits the decode depends on, passed as ib_lo
++//                              (sub-block of a superblock, parity of a block that is not dword aligned)
++// Types with a common scale layout define A_SCALE_F16_D, A_SCALE_F16_DM or A_SCALE_K4 instead of
++// the block_a_scale functions; the shared implementations follow the type list.
++// block_a_load() should only issue loads: ALU work on loaded data belongs to the *_to_shmem functions,
++// otherwise the prefetch has to wait for its own loads before the WMMA work it is meant to overlap.
++
++// Q4_0, Q5_0, Q8_0 and IQ4_NL blocks are 2 mod 4 bytes long, so their 4-byte fields are dword aligned
++// only in every other block. block_a_load() loads the two dwords covering such a field and the LDS store
++// extracts it: extracting at load time (as compilers do for a merged 16-bit pair) makes the prefetch wait
++// for its own loads.
++uvec2 a_load_window(uint byte_off) {
++    const uint dw = byte_off >> 2;
++    return uvec2(data_a_u32[dw], data_a_u32[dw + 1u]);
++}
++
++// The field from a_load_window(), for a block size and field offset both 2 mod 4.
++uint32_t a_window_dword(uvec2 w, uint ib_lo) {
++    return (ib_lo & 1u) == 0u ? (w.x >> 16u) | (w.y << 16u) : w.x;
++}
++
++#ifdef A_KVALUES
++// Four 4-bit indices, one per byte, to their int8 values.
++uint32_t a_kvalues4(uint32_t idx) {
++    const u8vec4 i = unpack8(idx);
++    return pack32(i8vec4(cm1_kvalues[i.x], cm1_kvalues[i.y], cm1_kvalues[i.z], cm1_kvalues[i.w]));
++}
++#endif
++
++// a_scale_fetch() returns (scale, -ACC_BIAS_F * scale, min) of scale group g for the epilogue.
++#ifdef A_HAS_MIN
++void a_scale_store(uint ks, uint row, float d, float m) {
++    buf_a_dm[ks * BM + row] = vec2(d, m);
++}
++void a_scale_zero(uint ks, uint row) {
++    a_scale_store(ks, row, 0.0, 0.0);
++}
++vec3 a_scale_fetch(uint ks, uint g, uint row) {
++    const vec2 dm = buf_a_dm[ks * BM + row];
++    return vec3(dm.x, -ACC_BIAS_F * dm.x, dm.y);
++}
++#elif KSCALES == 2
++void a_scale_store(uint ks, uint row, float d0, float d1) {
++    buf_a_d[(ks * KSCALES    ) * BM + row] = d0;
++    buf_a_d[(ks * KSCALES + 1) * BM + row] = d1;
++}
++void a_scale_zero(uint ks, uint row) {
++    a_scale_store(ks, row, 0.0, 0.0);
++}
++vec3 a_scale_fetch(uint ks, uint g, uint row) {
++    const float d = buf_a_d[(ks * KSCALES + g) * BM + row];
++    return vec3(d, -ACC_BIAS_F * d, 0.0);
++}
++#else
++void a_scale_store(uint ks, uint row, float d) {
++    buf_a_dn[ks * BM + row] = vec2(d, -ACC_BIAS_F * d);
++}
++void a_scale_zero(uint ks, uint row) {
++    a_scale_store(ks, row, 0.0);
++}
++vec3 a_scale_fetch(uint ks, uint g, uint row) {
++    return vec3(buf_a_dn[ks * BM + row], 0.0);
++}
++#endif
+ 
+ #if defined(DATA_A_Q4_0)
+ 
++#define A_IB_LO_MASK 1u
++#define A_SCALE_F16_D
+ struct block_a_prefetch {
+-    uint32_t qs;
+-    float16_t d;
++    uvec2 qs;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+-    blk.qs = pack32(u16vec2(data_a_packed16[ib].qs[loadr * 2],
+-                             data_a_packed16[ib].qs[loadr * 2 + 1]));
+-    blk.d = data_a_packed16[ib].d;
++    blk.qs = a_load_window(ib * 18u + 2u + loadr * 4u);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    uint32_t lo4 = blk.qs & 0x0F0F0F0F;
+-    uint32_t hi4 = (blk.qs >> 4) & 0x0F0F0F0F;
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    const uint32_t qs = a_window_dword(blk.qs, ib_lo);
++    uint32_t lo4 = qs & 0x0F0F0F0F;
++    uint32_t hi4 = (qs >> 4) & 0x0F0F0F0F;
+     lo4 = ((lo4 | 0x80808080) - 0x08080808) ^ 0x80808080;
+     hi4 = ((hi4 | 0x80808080) - 0x08080808) ^ 0x80808080;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = lo4;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = hi4;
+-
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
+-    }
+ }
+ 
+ #elif defined(DATA_A_Q4_1)
+ 
++#define A_IB_LO_MASK 0u
++#define A_SCALE_F16_DM
+ struct block_a_prefetch {
+     uint32_t qs;
+-    f16vec2 dm;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+     blk.qs = data_a_packed32[ib].qs[loadr];
+-    blk.dm = data_a_packed32[ib].dm;
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     // Store raw unsigned nibbles; the -8 offset is absorbed by the min term.
+     uint32_t lo4 = blk.qs & 0x0F0F0F0F;
+     uint32_t hi4 = (blk.qs >> 4) & 0x0F0F0F0F;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = lo4;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = hi4;
+-
+-    if (loadr == 0) {
+-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(float(blk.dm.x), float(blk.dm.y)) : vec2(0.0f);
+-    }
+ }
+ 
+ #elif defined(DATA_A_Q5_0)
+ 
++#define A_IB_LO_MASK 1u
++#define A_SCALE_F16_D
+ struct block_a_prefetch {
+-    uint32_t qs;
+-    float16_t d;
+-    uint32_t qh;
++    uvec2 qs;
++    uvec2 qh;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+-    blk.qs = pack32(u16vec2(data_a_packed16[ib].qs[loadr * 2],
+-                             data_a_packed16[ib].qs[loadr * 2 + 1]));
+-    blk.d = data_a_packed16[ib].d;
+-    blk.qh = pack32(u16vec2(data_a_packed16[ib].qh[0], data_a_packed16[ib].qh[1]));
++    blk.qs = a_load_window(ib * 22u + 6u + loadr * 4u);
++    blk.qh = a_load_window(ib * 22u + 2u);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    uint32_t lo4 = blk.qs & 0x0F0F0F0F;
+-    uint32_t hi4 = (blk.qs >> 4) & 0x0F0F0F0F;
+-    lo4 |= ((blk.qh >> (4u * loadr       )) & 0xFu) * 0x02040810u & 0x10101010u;
+-    hi4 |= ((blk.qh >> (4u * loadr + 16u )) & 0xFu) * 0x02040810u & 0x10101010u;
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    const uint32_t qs = a_window_dword(blk.qs, ib_lo);
++    const uint32_t qh = a_window_dword(blk.qh, ib_lo);
++    uint32_t lo4 = qs & 0x0F0F0F0F;
++    uint32_t hi4 = (qs >> 4) & 0x0F0F0F0F;
++    lo4 |= ((qh >> (4u * loadr       )) & 0xFu) * 0x02040810u & 0x10101010u;
++    hi4 |= ((qh >> (4u * loadr + 16u )) & 0xFu) * 0x02040810u & 0x10101010u;
+     lo4 = ((lo4 | 0x80808080) - 0x10101010) ^ 0x80808080;
+     hi4 = ((hi4 | 0x80808080) - 0x10101010) ^ 0x80808080;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = lo4;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = hi4;
+-
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
+-    }
+ }
+ 
+ #elif defined(DATA_A_Q5_1)
+ 
++#define A_IB_LO_MASK 0u
++#define A_SCALE_F16_DM
+ struct block_a_prefetch {
+     uint32_t qs;
+-    f16vec2 dm;
+     uint32_t qh;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+     blk.qs = data_a_packed32[ib].qs[loadr];
+-    blk.dm = data_a_packed32[ib].dm;
+     blk.qh = data_a_packed32[ib].qh;
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     // Store raw unsigned 5-bit values; the -16 offset is absorbed by the min term.
+     uint32_t lo4 = blk.qs & 0x0F0F0F0F;
+     uint32_t hi4 = (blk.qs >> 4) & 0x0F0F0F0F;
+@@ -114,70 +170,51 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
+     hi4 |= ((blk.qh >> (4u * loadr + 16u )) & 0xFu) * 0x02040810u & 0x10101010u;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = lo4;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = hi4;
+-
+-    if (loadr == 0) {
+-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(float(blk.dm.x), float(blk.dm.y)) : vec2(0.0f);
+-    }
+ }
+ 
+ #elif defined(DATA_A_Q8_0)
+ 
++#define A_IB_LO_MASK 1u
++#define A_SCALE_F16_D
+ struct block_a_prefetch {
+-    uint32_t qs;
+-    float16_t d;
++    uvec2 qs;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+-    blk.qs = pack32(u16vec2(data_a_packed16[ib].qs[loadr * 2],
+-                             data_a_packed16[ib].qs[loadr * 2 + 1]));
+-    blk.d = data_a_packed16[ib].d;
++    blk.qs = a_load_window(ib * 34u + 2u + loadr * 4u);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr] = blk.qs;
+-
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
+-    }
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr] = a_window_dword(blk.qs, ib_lo);
+ }
+ 
+ #elif defined(DATA_A_IQ4_NL)
+ 
++#define A_IB_LO_MASK 1u
++#define A_SCALE_F16_D
+ struct block_a_prefetch {
+-    uint32_t qs;
+-    float16_t d;
++    uvec2 qs;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+-    blk.qs = pack32(u16vec2(data_a_packed16[ib].qs[loadr * 2],
+-                             data_a_packed16[ib].qs[loadr * 2 + 1]));
+-    blk.d = data_a_packed16[ib].d;
++    blk.qs = a_load_window(ib * 18u + 2u + loadr * 4u);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    const u8vec4 lo_idx = unpack8(blk.qs & 0x0F0F0F0F);
+-    const u8vec4 hi_idx = unpack8((blk.qs >> 4) & 0x0F0F0F0F);
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] =
+-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
+-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] =
+-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
+-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
+-
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
+-    }
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    const uint32_t qs = a_window_dword(blk.qs, ib_lo);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = a_kvalues4(qs & 0x0F0F0F0F);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = a_kvalues4((qs >> 4) & 0x0F0F0F0F);
+ }
+ 
+ #elif defined(DATA_A_IQ4_XS)
+ 
++#define A_IB_LO_MASK 7u
+ struct block_a_prefetch {
+     uint32_t qs;
+-    float d;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+@@ -185,35 +222,41 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     const uint ib_k = ib / 8;
+     const uint ib32 = ib % 8;
+     blk.qs = data_a_packed32[ib_k].qs[4 * ib32 + loadr];
+-    blk.d = 0.0;
+-    if (loadr == 0) {
+-        const uint sl = (data_a_packed32[ib_k].scales_l >> (4 * ib32)) & 0xF;
+-        const uint sh = (data_a_packed32[ib_k].scales_h >> (2 * ib32)) & 3;
+-        blk.d = float(data_a_packed32[ib_k].d) * float(int(sl | (sh << 4)) - 32);
+-    }
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    const u8vec4 lo_idx = unpack8(blk.qs & 0x0F0F0F0F);
+-    const u8vec4 hi_idx = unpack8((blk.qs >> 4) & 0x0F0F0F0F);
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] =
+-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
+-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] =
+-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
+-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = a_kvalues4(blk.qs & 0x0F0F0F0F);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = a_kvalues4((blk.qs >> 4) & 0x0F0F0F0F);
++}
+ 
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? blk.d : 0.0f;
+-    }
++struct block_a_scale {
++    float16_t d;
++    uint16_t scales_h;
++    uint32_t scales_l;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    const uint ib_k = ib / 8;
++    sc.d = data_a_packed32[ib_k].d;
++    sc.scales_h = data_a_packed32[ib_k].scales_h;
++    sc.scales_l = data_a_packed32[ib_k].scales_l;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    const uint sl = (sc.scales_l >> (4 * ib_lo)) & 0xF;
++    const uint sh = (uint(sc.scales_h) >> (2 * ib_lo)) & 3;
++    a_scale_store(ks, row, float(sc.d) * float(int(sl | (sh << 4)) - 32));
+ }
+ 
+ #elif defined(DATA_A_MXFP4)
+ 
++// 17-byte blocks: block_a_load packs u8 loads (a dword window was not a consistent win).
++#define A_IB_LO_MASK 0u
+ struct block_a_prefetch {
+     uint32_t qs;
+-    uint8_t e;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+@@ -222,135 +265,87 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
+                             data_a[ib].qs[loadr * 4 + 1],
+                             data_a[ib].qs[loadr * 4 + 2],
+                             data_a[ib].qs[loadr * 4 + 3]));
+-    blk.e = data_a[ib].e;
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    const u8vec4 lo_idx = unpack8(blk.qs & 0x0F0F0F0F);
+-    const u8vec4 hi_idx = unpack8((blk.qs >> 4) & 0x0F0F0F0F);
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] =
+-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
+-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] =
+-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
+-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] = a_kvalues4(blk.qs & 0x0F0F0F0F);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] = a_kvalues4((blk.qs >> 4) & 0x0F0F0F0F);
++}
+ 
+-    if (loadr == 0) {
+-        buf_a_d[ks * BM + buf_ib] = in_bounds ? e8m0_to_fp32(blk.e) * 0.5 : 0.0f;
+-    }
++struct block_a_scale {
++    uint8_t e;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    sc.e = data_a[ib].e;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    a_scale_store(ks, row, e8m0_to_fp32(sc.e) * 0.5);
+ }
+ 
+ // LOAD_VEC_A=8 for k-quants and NVFP4: loadr has 4 positions, each writes 2 uint32
+ 
+ #elif defined(DATA_A_Q4_K)
+ 
++#define A_IB_LO_MASK 7u
++#define A_SCALE_K4
+ struct block_a_prefetch {
+-    uint32_t qs0;
+-    uint32_t qs1;
+-    uint ib;
++    uvec2 qs;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+     const uint ib_k = ib / 8;
+-    const uint sub = ib % 8;
+-    const uint qs_base = (sub >> 1) * 8;
+-
+-    uint32_t raw0 = data_a_packed32[ib_k].qs[qs_base + loadr * 2];
+-    uint32_t raw1 = data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1];
+-    if ((sub & 1u) != 0u) {
+-        blk.qs0 = (raw0 >> 4) & 0x0F0F0F0F;
+-        blk.qs1 = (raw1 >> 4) & 0x0F0F0F0F;
+-    } else {
+-        blk.qs0 = raw0 & 0x0F0F0F0F;
+-        blk.qs1 = raw1 & 0x0F0F0F0F;
+-    }
+-    blk.ib = ib;
+-
++    const uint qs_base = ((ib % 8) >> 1) * 8;
++    blk.qs = uvec2(data_a_packed32[ib_k].qs[qs_base + loadr * 2],
++                   data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1]);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    // Store raw unsigned nibbles (blk.qs already masked); no -8 recentering needed.
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = blk.qs0;
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = blk.qs1;
+-
+-    if (loadr == 0) {
+-        const uint ib_k = blk.ib / 8;
+-        const uint sub = blk.ib % 8;
+-        const uint j = sub & 3u;
+-        const uint s_j  = uint(data_a[ib_k].scales[j]);
+-        const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
+-        const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
+-        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+-        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
+-        vec2 dm = vec2(data_a_packed32[ib_k].dm);
+-        float d_scaled = dm.x * float(sc_val);
+-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(d_scaled, -(dm.y * float(mn_val))) : vec2(0.0f);
+-    }
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
++    // Store raw unsigned nibbles; no -8 recentering needed.
++    const uvec2 v = (blk.qs >> ((ib_lo & 1u) * 4u)) & 0x0F0F0F0Fu;
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = v.x;
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v.y;
+ }
+ 
+ #elif defined(DATA_A_Q5_K)
+ 
++#define A_IB_LO_MASK 7u
++#define A_SCALE_K4
+ struct block_a_prefetch {
+-    uint32_t qs0;
+-    uint32_t qs1;
+-    uint32_t qh0;
+-    uint32_t qh1;
+-    uint ib;
++    uvec2 qs;
++    uvec2 qh;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+     block_a_prefetch blk;
+     const uint ib_k = ib / 8;
+-    const uint sub = ib % 8;
+-    const uint qs_base = (sub >> 1) * 8;
+-
+-    uint32_t raw0 = data_a_packed32[ib_k].qs[qs_base + loadr * 2];
+-    uint32_t raw1 = data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1];
+-    if ((sub & 1u) != 0u) {
+-        blk.qs0 = (raw0 >> 4) & 0x0F0F0F0F;
+-        blk.qs1 = (raw1 >> 4) & 0x0F0F0F0F;
+-    } else {
+-        blk.qs0 = raw0 & 0x0F0F0F0F;
+-        blk.qs1 = raw1 & 0x0F0F0F0F;
+-    }
+-    blk.qh0 = ((data_a_packed32[ib_k].qh[loadr * 2    ] >> sub) & 0x01010101) << 4;
+-    blk.qh1 = ((data_a_packed32[ib_k].qh[loadr * 2 + 1] >> sub) & 0x01010101) << 4;
+-    blk.ib = ib;
+-
++    const uint qs_base = ((ib % 8) >> 1) * 8;
++    blk.qs = uvec2(data_a_packed32[ib_k].qs[qs_base + loadr * 2],
++                   data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1]);
++    blk.qh = uvec2(data_a_packed32[ib_k].qh[loadr * 2], data_a_packed32[ib_k].qh[loadr * 2 + 1]);
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     // Store raw unsigned 5-bit values (qs nibble | qh bit); no -16 recentering needed.
+-    uint32_t v0 = blk.qs0 | blk.qh0;
+-    uint32_t v1 = blk.qs1 | blk.qh1;
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = v0;
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
+-
+-    if (loadr == 0) {
+-        const uint ib_k = blk.ib / 8;
+-        const uint sub = blk.ib % 8;
+-        const uint j = sub & 3u;
+-        const uint s_j  = uint(data_a[ib_k].scales[j]);
+-        const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
+-        const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
+-        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+-        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
+-        vec2 dm = vec2(data_a_packed32[ib_k].dm);
+-        float d_scaled = dm.x * float(sc_val);
+-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(d_scaled, -(dm.y * float(mn_val))) : vec2(0.0f);
+-    }
++    const uvec2 v = ((blk.qs >> ((ib_lo & 1u) * 4u)) & 0x0F0F0F0Fu) | (((blk.qh >> ib_lo) & 0x01010101u) << 4);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = v.x;
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v.y;
+ }
+ 
+ #elif defined(DATA_A_Q6_K)
+ 
++// 210-byte blocks: block_a_load packs u16 loads and decodes; a dword window would cost ~32 VGPRs.
++#define A_IB_LO_MASK 7u
+ struct block_a_prefetch {
+     uint32_t qs0;
+     uint32_t qs1;
+-    uint ib;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+@@ -383,32 +378,42 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
+ 
+     blk.qs0 = ql0 | (((qh0 >> qh_shift) & 0x03030303) << 4);
+     blk.qs1 = ql1 | (((qh1 >> qh_shift) & 0x03030303) << 4);
+-    blk.ib = ib;
+ 
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     uint32_t v0 = ((blk.qs0 | 0x80808080) - 0x20202020) ^ 0x80808080;
+     uint32_t v1 = ((blk.qs1 | 0x80808080) - 0x20202020) ^ 0x80808080;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = v0;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
++}
+ 
+-    if (loadr == 0) {
+-        const uint ib_k = blk.ib / 8;
+-        const uint sub = blk.ib % 8;
+-        i8vec2 sc = unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[sub]))).xy;
+-        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.x) : 0.0f;
+-        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.y) : 0.0f;
+-    }
++struct block_a_scale {
++    int16_t sc;
++    float16_t d;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    sc.sc = data_a_packed16[ib / 8].scales[ib % 8];
++    sc.d = data_a_packed16[ib / 8].d;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    const i8vec2 s = unpack8(int32_t(sc.sc)).xy;
++    const float d = float(sc.d);
++    a_scale_store(ks, row, d * float(s.x), d * float(s.y));
+ }
+ 
+ #elif defined(DATA_A_Q3_K)
+ 
++// 110-byte blocks: block_a_load packs u16 loads and decodes; a dword window would cost ~32 VGPRs.
++#define A_IB_LO_MASK 7u
+ struct block_a_prefetch {
+     uint32_t qs0;
+     uint32_t qs1;
+-    uint ib;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+@@ -434,39 +439,47 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
+ 
+     blk.qs0 = ((qs0 >> qs_shift) & 0x03030303) | (((hm0 >> hm_bit) & 0x01010101) << 2);
+     blk.qs1 = ((qs1 >> qs_shift) & 0x03030303) | (((hm1 >> hm_bit) & 0x01010101) << 2);
+-    blk.ib = ib;
+ 
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     uint32_t v0 = ((blk.qs0 | 0x80808080) - 0x04040404) ^ 0x80808080;
+     uint32_t v1 = ((blk.qs1 | 0x80808080) - 0x04040404) ^ 0x80808080;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = v0;
+     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
++}
+ 
+-    if (loadr == 0) {
+-        const uint ib_k = blk.ib / 8;
+-        const uint sub = blk.ib % 8;
+-        const uint is = sub * 2;
+-        uint lo = uint(data_a_packed16[ib_k].scales[(is % 8) / 2]);
+-        lo = (lo >> (4 * (is / 8))) & 0x0F0Fu;
+-        uint hi = uint(data_a_packed16[ib_k].scales[(8 + (is % 4)) / 2]);
+-        hi = (hi >> (2 * (is / 4))) & 0x0303u;
+-        uint combined = lo | (hi << 4);
+-        i8vec2 sc = unpack8(int32_t(combined)).xy;
+-        float d = float(data_a_packed16[ib_k].d);
+-        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? d * float(int(sc.x) - 32) : 0.0f;
+-        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? d * float(int(sc.y) - 32) : 0.0f;
+-    }
++struct block_a_scale {
++    uint16_t lo;
++    uint16_t hi;
++    float16_t d;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    const uint ib_k = ib / 8;
++    const uint is = (ib % 8) * 2;
++    sc.lo = data_a_packed16[ib_k].scales[(is % 8) / 2];
++    sc.hi = data_a_packed16[ib_k].scales[(8 + (is % 4)) / 2];
++    sc.d = data_a_packed16[ib_k].d;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    const uint is = ib_lo * 2;
++    const uint lo = (uint(sc.lo) >> (4 * (is / 8))) & 0x0F0Fu;
++    const uint hi = (uint(sc.hi) >> (2 * (is / 4))) & 0x0303u;
++    const i8vec2 s = unpack8(int32_t(lo | (hi << 4))).xy;
++    const float d = float(sc.d);
++    a_scale_store(ks, row, d * float(int(s.x) - 32), d * float(int(s.y) - 32));
+ }
+ 
+ #elif defined(DATA_A_NVFP4)
+ 
++#define A_IB_LO_MASK 0u
+ struct block_a_prefetch {
+     uint32_t qs;
+-    uint8_t d0;
+-    uint8_t d1;
+ };
+ 
+ block_a_prefetch block_a_load(uint ib, uint loadr) {
+@@ -480,28 +493,98 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
+                             data_a[ib_k].qs[sub * 8 + byte_group * 4 + 1],
+                             data_a[ib_k].qs[sub * 8 + byte_group * 4 + 2],
+                             data_a[ib_k].qs[sub * 8 + byte_group * 4 + 3]));
+-    blk.d0 = data_a[ib_k].d[ihalf * 2];
+-    blk.d1 = data_a[ib_k].d[ihalf * 2 + 1];
+ 
+     return blk;
+ }
+ 
+-void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+-    const u8vec4 lo_idx = unpack8(blk.qs & 0x0F0F0F0F);
+-    const u8vec4 hi_idx = unpack8((blk.qs >> 4) & 0x0F0F0F0F);
++void block_a_to_shmem(block_a_prefetch blk, uint ib_lo, uint buf_ib, uint ks, uint loadr) {
+     const uint sub_base = (loadr >> 1) * 4;
+     const uint byte_group = loadr & 1u;
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + byte_group] =
+-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
+-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + 2 + byte_group] =
+-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
+-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + byte_group    ] = a_kvalues4(blk.qs & 0x0F0F0F0F);
++    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + byte_group + 2] = a_kvalues4((blk.qs >> 4) & 0x0F0F0F0F);
++}
+ 
+-    if (loadr == 0) {
+-        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? ue4m3_to_fp32(blk.d0) * 0.5 : 0.0f;
+-        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? ue4m3_to_fp32(blk.d1) * 0.5 : 0.0f;
+-    }
++struct block_a_scale {
++    uint8_t d0;
++    uint8_t d1;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    const uint ib_k = ib / 2;
++    const uint ihalf = ib % 2;
++    sc.d0 = data_a[ib_k].d[ihalf * 2];
++    sc.d1 = data_a[ib_k].d[ihalf * 2 + 1];
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    a_scale_store(ks, row, ue4m3_to_fp32(sc.d0) * 0.5, ue4m3_to_fp32(sc.d1) * 0.5);
++}
++
++#endif
++
++// ===== Shared A scale layouts =====
++
++#if defined(A_SCALE_F16_D)
++
++struct block_a_scale {
++    float16_t d;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    sc.d = data_a_packed16[ib].d;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    a_scale_store(ks, row, float(sc.d));
++}
++
++#elif defined(A_SCALE_F16_DM)
++
++struct block_a_scale {
++    f16vec2 dm;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    sc.dm = data_a_packed32[ib].dm;
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    a_scale_store(ks, row, float(sc.dm.x), float(sc.dm.y));
++}
++
++#elif defined(A_SCALE_K4)
++
++struct block_a_scale {
++    f16vec2 dm;
++    uvec3 scales;
++};
++
++block_a_scale block_a_scale_load(uint ib) {
++    block_a_scale sc;
++    const uint ib_k = ib / 8;
++    sc.dm = data_a_packed32[ib_k].dm;
++    sc.scales = uvec3(data_a_packed32[ib_k].scales[0],
++                      data_a_packed32[ib_k].scales[1],
++                      data_a_packed32[ib_k].scales[2]);
++    return sc;
++}
++
++void block_a_scale_to_shmem(block_a_scale sc, uint ib_lo, uint ks, uint row) {
++    const uint sub = ib_lo;
++    const uint j = sub & 3u;
++    const uint s_j  = (sc.scales.x >> (8 * j)) & 0xFFu;
++    const uint s_j4 = (sc.scales.y >> (8 * j)) & 0xFFu;
++    const uint s_j8 = (sc.scales.z >> (8 * j)) & 0xFFu;
++    const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
++    const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
++    const vec2 dm = vec2(sc.dm);
++    a_scale_store(ks, row, dm.x * float(sc_val), -(dm.y * float(mn_val)));
+ }
+ 
+ #endif
+@@ -511,7 +594,7 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
+ struct block_b_prefetch {
+     ivec4 qs;
+     float16_t d;
+-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#ifdef A_HAS_MIN
+     float16_t s;
+ #endif
+ };
+@@ -520,7 +603,7 @@ block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
+     block_b_prefetch blk;
+     blk.qs = data_b[ib_outer].qs[ib_inner * 2 + loadr];
+     blk.d = data_b[ib_outer].ds[ib_inner].x;
+-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#ifdef A_HAS_MIN
+     blk.s = data_b[ib_outer].ds[ib_inner].y;
+ #endif
+     return blk;
+@@ -528,14 +611,10 @@ block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
+ 
+ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+     const ivec4 v = in_bounds ? blk.qs : ivec4(0);
+-    const uint base = buf_ib * QPITCH + ks * (BK / 4) + loadr * 4;
+-    buf_b_qs[base    ] = v.x;
+-    buf_b_qs[base + 1] = v.y;
+-    buf_b_qs[base + 2] = v.z;
+-    buf_b_qs[base + 3] = v.w;
++    buf_b_qs[(buf_ib * QPITCH + ks * (BK / 4)) / 4 + loadr] = uvec4(v);
+     if (loadr == 0) {
+         buf_b_d[ks * BN + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
+-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
++#ifdef A_HAS_MIN
+         buf_b_s[ks * BN + buf_ib] = in_bounds ? float(blk.s) : 0.0f;
+ #endif
+     }
+@@ -553,13 +632,39 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
+             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
+ #endif
+ 
++#define A_STORE_LOOP(IB)                                                                        \
++    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
++        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
++        if (buf_ib < BM) {                                                                      \
++            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
++                block_a_to_shmem(pre_a[li * BK_STEP + ks], (IB) & A_IB_LO_MASK, buf_ib, ks, loadr_a); \
++            }                                                                                   \
++        }                                                                                       \
++    }
++
++// If the row stride keeps ib_lo and the k step starts at a multiple of BK_STEP, every row has the same ib_lo
++// for block ks, and its bits below BK_STEP are ks: the decode then sees them as compile-time constants.
++// Only the dword windows (A_IB_LO_MASK 1) gain from that; for the K-quants the second store loop does not pay off.
++#define A_IB_LO_FIXED (A_IB_LO_MASK & (BK_STEP - 1u))
++#define A_IB_LO_UNIFORM (A_IB_LO_MASK == 1u && (p.stride_a / BK) % 2u == 0u && (pos_a_ib & A_IB_LO_FIXED) == 0u)
++
++// A scales are loaded with one (row, ks) block per thread instead of one per loadr group.
++// A k step past end_k re-reads an in-bounds block; its scale is zeroed in STORE_BLOCK_TO_LDS.
+ #define PREFETCH_BLOCK(blk)                                                                     \
++    [[unroll]] for (uint li = 0; li < A_SCALE_LOADS; li++) {                                    \
++        const uint s_idx = gl_LocalInvocationID.x + li * BLOCK_SIZE;                            \
++        if (s_idx < BM * BK_STEP) {                                                             \
++            const uint ks = s_idx % BK_STEP;                                                    \
++            const uint ks_ld = ((blk) + ks * BK < end_k) ? ks : 0u;                             \
++            pre_sc[li] = block_a_scale_load(pos_a_ib + (s_idx / BK_STEP) * p.stride_a / BK      \
++                                            + ks_ld);                                           \
++        }                                                                                       \
++    }                                                                                           \
+     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+         if (buf_ib < BM) {                                                                      \
+             const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
+             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+-                /* a k step past end_k re-reads an in-bounds block; its scale is zeroed below */ \
+                 const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
+                 pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
+             }                                                                                   \
+@@ -577,15 +682,23 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
+     }
+ 
+ #define STORE_BLOCK_TO_LDS(blk)                                                                 \
+-    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+-        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+-        if (buf_ib < BM) {                                                                      \
+-            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+-                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
+-                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);     \
++    [[unroll]] for (uint li = 0; li < A_SCALE_LOADS; li++) {                                    \
++        const uint s_idx = gl_LocalInvocationID.x + li * BLOCK_SIZE;                            \
++        if (s_idx < BM * BK_STEP) {                                                             \
++            const uint ks = s_idx % BK_STEP;                                                    \
++            if ((blk) + ks * BK < end_k) {                                                      \
++                const uint ib = pos_a_ib + (s_idx / BK_STEP) * p.stride_a / BK + ks;            \
++                block_a_scale_to_shmem(pre_sc[li], ib & A_IB_LO_MASK, ks, s_idx / BK_STEP);     \
++            } else {                                                                            \
++                a_scale_zero(ks, s_idx / BK_STEP);                                              \
+             }                                                                                   \
+         }                                                                                       \
+     }                                                                                           \
++    if (A_IB_LO_UNIFORM) {                                                                      \
++        A_STORE_LOOP((pos_a_ib & ~A_IB_LO_FIXED) + ks)                                          \
++    } else {                                                                                    \
++        A_STORE_LOOP(pos_a_ib + buf_ib * p.stride_a / BK + ks)                                  \
++    }                                                                                           \
+     [[unroll]] for (uint li = 0; li < B_LOADS; li++) {                                          \
+         const uint buf_ib = loadc_b + li * loadstride_b;                                        \
+         if (buf_ib < BN) {                                                                      \

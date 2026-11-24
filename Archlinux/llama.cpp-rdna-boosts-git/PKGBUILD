@@ -1,0 +1,335 @@
+# Pinned RDNA Boosts r353 build for gfx1101 (Navi 32) with HIP and Vulkan.
+# Standard system install: /usr/bin, /usr/lib, /usr/include.
+# Replaces other llama.cpp/ggml packages; no private prefix or wrappers.
+#
+# Patch stack on upstream 919794500 (tree-checked after every stage):
+#   1. RDNA Boosts default set: blocks 0000-0016 + temporary block 0300.
+#   2. RDNA Boosts optional block 0101 (mixed-kv): K=q8_0 with V=q4_0/q5_0/q5_1
+#      on all-256-wide-head models; inert unless -ctk/-ctv differ.
+#   3. Merged upstream fixes newer than the base, cherry-picked by commit.
+#   4. Open upstream PRs, vendored here: #32839 + #32841 (HIP wave
+#      primitives), #32919 (Vulkan coopmat1 int8 MMQ on AMD compilers).
+#
+# Overrides:
+#   LLAMA_BUILD_JOBS=8
+#   GGML_CUDA_FA_QUANTS='q4_0-q4_0;q8_0-q8_0;bf16-bf16;f16-f16'
+#   CMAKE_HIP_FLAGS='...'
+#   LLAMA_BUILD_EXTRA_ARGS='-DNAME=VALUE ...' (whitespace-delimited only)
+
+pkgname=llama.cpp-rdna-boosts-git
+pkgver=17.919794500.r353
+pkgrel=1
+pkgdesc='RDNA Boosts llama.cpp (gfx1101 HIP + Vulkan)'
+arch=('x86_64')
+url='https://github.com/stew675/llama-cpp-rdna-boosts'
+# Apache-2.0: RDNA Boosts block 03 GDN kernels ported from radiance (see its NOTICE).
+license=('MIT' 'Apache-2.0')
+
+provides=('llama.cpp' 'ggml' 'libggml')
+conflicts=('llama.cpp' 'ggml' 'libggml')
+
+depends=(
+  curl
+  gcc-libs
+  glibc
+  openmp
+  hip-runtime-amd
+  hipblas
+  rocblas
+  vulkan-icd-loader
+)
+makedepends=(
+  cmake
+  git
+  jq
+  ccache
+  ninja
+  shaderc
+  vulkan-headers
+  spirv-headers
+  rocm-hip-sdk
+)
+optdepends=(
+  'vulkan-radeon: RADV Vulkan driver'
+  'python-numpy: GGUF model conversion'
+  'python-safetensors: GGUF model conversion'
+  'python-sentencepiece: GGUF model conversion'
+  'python-pytorch: GGUF model conversion'
+  'python-transformers: GGUF model conversion'
+  'python-gguf: GGUF model conversion'
+)
+options=('lto' '!debug')
+
+# Paired release pins: never move the patch delivery independently of its base.
+# The tree IDs are an independent guard against moved tags or source drift.
+_upstream_commit='919794500'
+_boosts_tag='v17-919794500-r353'
+_upstream_tree='916941663346eb86004bed77f74e90fcf9c43126'
+_boosts_tree='27db9bfd4ef7f41c7df60f704410de28863beac3'
+_boosts_blocks='17'
+_boosts_default='18'
+_mixed_kv_patch='0101-mixed-kv.patch'
+_mixed_kv_sha256='1f22b372d60b5c52776a4ccd83fe8100ba9564bbfa67125cbc8eb9c795172c8a'
+_mixed_kv_tree='c5cb865a4237729c1416670ddc5d7842dd3ec357'
+
+# Merged upstream master commits after the base, in upstream order. Each one
+# applies cleanly on the stack above; conflicting ones are left to the next
+# RDNA Boosts re-base.
+_upstream_picks=(
+  46eb1742db  # llama-grammar: fix integer overflow (#32551)
+  b052049276  # vulkan: fix memset for unaligned ranges on non-UMA devices (#32725)
+  8a97fa98ab  # vulkan: support non-contiguous src in SCALE (#32735)
+  9c10c94e16  # ggml: fix nonzero clear on non-UMA devices (#32727)
+  8d60873dfb  # gguf: no invalid enum values from untrusted file data (#32641)
+  46f4da2174  # ggml-cuda: zero blocks in few-row MMQ quantization (#32566)
+  2a487782f2  # vocab: speed up BPE tokenization (#32859)
+  9578bd3fe4  # CUDA: ignore strides of size-1 dims in bin_bcast (#32854)
+)
+_pr_patches=(
+  pr32839-hip-readlane-uniform-shuffle.patch
+  pr32841-hip-mbcnt-ballot-rank.patch
+  pr32919-vulkan-cm1-int8-mmq-amd.patch
+)
+_final_tree='39b0a092b3b5eba2dddd175b41c701efe8cf1746'
+
+source=(
+  "llama.cpp::git+https://github.com/ggml-org/llama.cpp.git#commit=${_upstream_commit}"
+  "rdna-boosts::git+https://github.com/stew675/llama-cpp-rdna-boosts.git#tag=${_boosts_tag}"
+  "${_pr_patches[@]}"
+)
+sha256sums=('SKIP'
+            'SKIP'
+            'ffae879538555afa6bd0497da12ecd6a8afc140aeee63c9f0497114816ccffb6'
+            '2cde6cd3c2423f29d3898dd4a493d4e14520499a874a436936832d09fc5375b9'
+            '8547ab9a6967e793591692218594078ee0a47a1ec1d45b4ea0f79aefa1e67722')
+
+pkgver() {
+  local release
+  release="$(jq -er '.release' "${srcdir}/rdna-boosts/release.json")" || return 1
+  if [[ ! "${release}" =~ ^v([0-9]+)-([0-9a-f]+)-r([0-9]+)$ ]]; then
+    printf 'ERROR: invalid RDNA Boosts release identity: %s\n' "${release}" >&2
+    return 1
+  fi
+  printf '%s.%s.r%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+
+_check_tree() {
+  local _expected="$1" _stage="$2"
+  if [[ "$(git rev-parse 'HEAD^{tree}')" != "${_expected}" ]]; then
+    printf 'ERROR: source tree after %s differs from the pinned tree %s\n' "${_stage}" "${_expected}" >&2
+    return 1
+  fi
+}
+
+prepare() {
+  local _manifest="${srcdir}/rdna-boosts/release.json"
+  local _mixed_kv="${srcdir}/rdna-boosts/optional/mixed-kv/${_mixed_kv_patch}"
+  local _base _base_tree _release _patched_tree _blocks _default _opt_sha _opt_tree _commit _patch
+
+  [[ -f "${_manifest}" ]] || {
+    printf 'ERROR: RDNA Boosts release.json is missing\n' >&2
+    return 1
+  }
+
+  _release="$(jq -er '.release' "${_manifest}")" || return 1
+  _base="$(jq -er '.base' "${_manifest}")" || return 1
+  _base_tree="$(jq -er '.base_tree' "${_manifest}")" || return 1
+  _patched_tree="$(jq -er '.tree' "${_manifest}")" || return 1
+  _blocks="$(jq -er '.n_blocks' "${_manifest}")" || return 1
+  _default="$(jq -er '.n_default' "${_manifest}")" || return 1
+  _opt_sha="$(jq -er --arg p "${_mixed_kv_patch}" '.optional[$p].sha256' "${_manifest}")" || return 1
+  _opt_tree="$(jq -er --arg p "${_mixed_kv_patch}" '.optional[$p].tree' "${_manifest}")" || return 1
+
+  if [[ "${_release}" != "${_boosts_tag}" ||
+        "${_base}" != "${_upstream_commit}" ||
+        "${_base_tree}" != "${_upstream_tree}" ||
+        "${_patched_tree}" != "${_boosts_tree}" ||
+        "${_blocks}" != "${_boosts_blocks}" ||
+        "${_default}" != "${_boosts_default}" ||
+        "${_opt_sha}" != "${_mixed_kv_sha256}" ||
+        "${_opt_tree}" != "${_mixed_kv_tree}" ]]; then
+    printf 'ERROR: RDNA Boosts delivery does not match pinned r353 metadata\n' >&2
+    return 1
+  fi
+  if [[ "$(sha256sum "${_mixed_kv}" | cut -d' ' -f1)" != "${_mixed_kv_sha256}" ]]; then
+    printf 'ERROR: optional patch %s does not match its pinned sha256\n' "${_mixed_kv_patch}" >&2
+    return 1
+  fi
+
+  cd "${srcdir}/llama.cpp" || return 1
+
+  # Only the disposable makepkg checkout is reset.
+  git am --abort >/dev/null 2>&1 || true
+  git cherry-pick --abort >/dev/null 2>&1 || true
+  git checkout --force --detach "${_upstream_commit}" || return 1
+  git reset --hard "${_upstream_commit}" || return 1
+  git clean -fd || return 1
+  git branch -D rdna-boosts-package >/dev/null 2>&1 || true
+
+  _check_tree "${_upstream_tree}" 'checkout of the llama.cpp baseline' || return 1
+
+  # git am and cherry-pick require a local committer identity. Never change global git config.
+  git config --local user.name 'RDNA Boosts package builder'
+  git config --local user.email 'rdna-boosts@localhost'
+  git config --local core.pager cat
+  export GIT_PAGER=cat PAGER=cat
+
+  RDNA_BRANCH=rdna-boosts-package \
+    bash "${srcdir}/rdna-boosts/scripts/apply-all.sh" \
+      "${srcdir}/llama.cpp" "${srcdir}/rdna-boosts" || return 1
+  # Enforce canonical patch result even if the helper used a 3-way fallback.
+  _check_tree "${_boosts_tree}" 'the RDNA Boosts default blocks' || return 1
+
+  git am --committer-date-is-author-date "${_mixed_kv}" || return 1
+  _check_tree "${_mixed_kv_tree}" "optional block ${_mixed_kv_patch}" || return 1
+
+  for _commit in "${_upstream_picks[@]}"; do
+    if ! git cherry-pick -x "${_commit}"; then
+      git cherry-pick --abort >/dev/null 2>&1 || true
+      printf 'ERROR: upstream commit %s no longer applies cleanly\n' "${_commit}" >&2
+      return 1
+    fi
+  done
+
+  # Plain diffs (attribution line, no author headers); committed with the local identity.
+  for _patch in "${_pr_patches[@]}"; do
+    if ! git apply --index "${srcdir}/${_patch}"; then
+      printf 'ERROR: %s no longer applies cleanly\n' "${_patch}" >&2
+      return 1
+    fi
+    git commit --quiet -m "Apply ${_patch%.patch}" || return 1
+  done
+  _check_tree "${_final_tree}" 'the upstream commits and PR patches' || return 1
+}
+
+build() {
+  cd "${srcdir}/llama.cpp" || return 1
+
+  export PATH="/opt/rocm/bin:$PATH"
+
+
+  command -v hipconfig >/dev/null || {
+    printf 'ERROR: hipconfig is unavailable; install the Arch ROCm HIP toolchain\n' >&2
+    return 1
+  }
+
+  export HIP_PLATFORM=amd
+  HIP_PATH="$(hipconfig -R)" || return 1
+  HIPCXX="$(hipconfig -l)/amdclang" || return 1
+  export HIP_PATH HIPCXX
+  if [[ ! -x "${HIPCXX}" ]]; then
+    printf 'ERROR: HIP compiler not executable: %s\n' "${HIPCXX}" >&2
+    return 1
+  fi
+
+  local _jobs="${LLAMA_BUILD_JOBS:-8}"
+  if [[ ! "${_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ERROR: LLAMA_BUILD_JOBS must be a positive integer\n' >&2
+    return 1
+  fi
+
+  # Compile only these symmetric flash-attention KV combinations by default.
+  # Use GGML_CUDA_FA_QUANTS=all only if its much larger build is justified.
+  local _fa_quants="${GGML_CUDA_FA_QUANTS:-q4_0-q4_0;q4_1-q4_1;q5_0-q5_0;q5_1-q5_1;q8_0-q8_0;bf16-bf16;f16-f16;iq4_nl-iq4_nl}"
+
+  local -a _cmake_options=(
+    -G Ninja
+    -S .
+    -B build-rdna-boosts
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_INSTALL_LIBDIR=lib
+    '-DCMAKE_INSTALL_RPATH=$ORIGIN:$ORIGIN/../lib'
+    -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+    -DBUILD_SHARED_LIBS=ON
+    -DGGML_BACKEND_DL=OFF
+    -DLLAMA_USE_SYSTEM_GGML=OFF
+
+    # Navi 32 code objects only.
+    -DGGML_HIP=ON
+    -DGGML_CUDA=OFF
+    -DAMDGPU_TARGETS=gfx1101
+    -DGPU_TARGETS=gfx1101
+    -DCMAKE_HIP_ARCHITECTURES=gfx1101
+
+    # Upstream defaults already tune many paths in this patch delivery.
+    -DGGML_HIP_GRAPHS=ON
+    -DGGML_HIP_NO_VMM=ON
+    -DGGML_HIP_RCCL=OFF
+    -DGGML_CUDA_FA=ON
+    -DGGML_CUDA_FA_ALL_QUANTS=OFF
+    "-DGGML_CUDA_FA_QUANTS=${_fa_quants}"
+    # Do NOT globally enable GGML_CUDA_FORCE_MMQ; let kernels dispatch by shape.
+
+    # Explicit alternative GPU backend for side-by-side HIP/Vulkan benchmarks.
+    -DGGML_VULKAN=ON
+
+    # GGML_NATIVE tunes the CPU backend for the build host; not portable.
+    -DGGML_NATIVE=ON
+    -DGGML_OPENMP=ON
+    -DGGML_CPU_REPACK=ON
+    -DGGML_LTO=ON
+
+    # HIP compilations dominate rebuild time; ccache all three languages.
+    -DGGML_CCACHE=ON
+    -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    -DLLAMA_BUILD_SERVER=ON
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_UI=OFF
+    -DLLAMA_USE_PREBUILT_UI=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DGGML_BUILD_TESTS=OFF
+    -DGGML_BUILD_EXAMPLES=OFF
+    -DGGML_ALL_WARNINGS=OFF
+    -DGGML_ALL_WARNINGS_3RD_PARTY=OFF
+    -Wno-dev
+  )
+
+  # Optional compiler experiments are intentionally not enabled by default.
+  if [[ -n "${CMAKE_HIP_FLAGS:-}" ]]; then
+    _cmake_options+=("-DCMAKE_HIP_FLAGS=${CMAKE_HIP_FLAGS}")
+  fi
+
+  # Whitespace-delimited -D switches only; no eval or shell code execution.
+  if [[ -n "${LLAMA_BUILD_EXTRA_ARGS:-}" ]]; then
+    local -a _extra_args=()
+    read -r -a _extra_args <<< "${LLAMA_BUILD_EXTRA_ARGS}"
+    _cmake_options+=("${_extra_args[@]}")
+  fi
+
+  cmake "${_cmake_options[@]}" || return 1
+  cmake --build build-rdna-boosts --parallel "${_jobs}"
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install "${srcdir}/llama.cpp/build-rdna-boosts" || return 1
+
+  local _required
+  for _required in llama-cli llama-server llama-bench; do
+    if [[ ! -x "${pkgdir}/usr/bin/${_required}" ]]; then
+      printf 'ERROR: expected installed executable missing: %s\n' "${_required}" >&2
+      return 1
+    fi
+  done
+
+  install -Dm644 "${srcdir}/llama.cpp/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/rdna-boosts/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-RDNA-BOOSTS"
+  install -Dm644 "${srcdir}/rdna-boosts/NOTICE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE-RDNA-BOOSTS"
+  install -Dm644 "${srcdir}/rdna-boosts/third_party/radiance/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-RADIANCE"
+  install -Dm644 "${srcdir}/rdna-boosts/third_party/radiance/NOTICE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE-RADIANCE"
+  install -Dm644 "${srcdir}/rdna-boosts/README.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/RDNA-BOOSTS.md"
+  install -Dm644 "${srcdir}/rdna-boosts/ENVIRONMENT.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/ENVIRONMENT.md"
+  install -Dm644 "${srcdir}/rdna-boosts/COMMUNITY-CONFIG.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/COMMUNITY-CONFIG.md"
+}
